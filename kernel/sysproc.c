@@ -89,3 +89,10 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_memsize(void)
+{
+  // Return the size (sz) of the current process's memory in bytes
+  return myproc()->sz;
+}
