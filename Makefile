@@ -115,9 +115,6 @@ mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
 # http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
 .PRECIOUS: %.o
 
-# Ensure the system runs on a single CPU to prevent race conditions
-CPUS := 1
-
 UPROGS=\
 	$U/_cat\
 	$U/_echo\
@@ -136,7 +133,6 @@ UPROGS=\
 	$U/_grind\
 	$U/_wc\
 	$U/_zombie\
-	$U/_memsize_test\
 	$U/_co_test\
 
 fs.img: mkfs/mkfs README $(UPROGS)

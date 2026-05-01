@@ -91,10 +91,15 @@ sys_uptime(void)
 }
 
 uint64
-sys_memsize(void)
+sys_co_yield(void)
 {
-  // Return the size (sz) of the current process's memory in bytes
-  return myproc()->sz;
+  int pid, value;
+  
+  // Extract the first two integer arguments from the user registers
+  if(argint(0, &pid) < 0 || argint(1, &value) < 0) {
+    return -1;
+  }
+    
+  // Call the core logic function located in proc.c
+  return do_co_yield(pid, value);
 }
-
-

@@ -680,4 +680,89 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+
+// Implementation of the cooperative multitasking yield
+// Located in kernel/proc.c
+int
+do_co_yield(int target_pid, int value)
+{
+  struct proc *p = myproc();
+  struct proc *target = 0;
+  struct proc *tmp;
+
+  // Error condition: PID is invalid (negative or zero) [cite: 184]
+  // Error condition: A process cannot yield to itself [cite: 185]
+  if(target_pid <= 0 || target_pid == p->pid) {
+    return -1;
+  }
+
+  // Find the target process in the process table [cite: 105, 205]
+  for(tmp = proc; tmp < &proc[NPROC]; tmp++){
+    if(tmp->pid == target_pid){
+      target = tmp;
+      break;
+    }
+  }
+
+  // Error condition: Target PID does not exist [cite: 183]
+  if(target == 0) {
+    return -1;
+  }
+
+  // Acquire target lock to check its state safely
+  acquire(&target->lock);
+
+  // Error condition: Target is already killed or is a zombie [cite: 183]
+  if(target->killed || target->state == UNUSED || target->state == ZOMBIE) {
+    release(&target->lock);
+    return -1;
+  }
+
+  // Wait mechanism: If the target is not ready (not yet SLEEPING/waiting for yield),
+  // the yielding process must sleep.
+  // We use the target's address as a wait channel.
+  while(target->state != SLEEPING && !target->killed) {
+    release(&target->lock);
+    
+    acquire(&p->lock);
+    sleep(target, &p->lock); 
+    release(&p->lock);
+    
+    acquire(&target->lock);
+  }
+
+  // Re-check if the target was killed while we were sleeping
+  if(target->killed){
+    release(&target->lock);
+    return -1;
+  }
+
+  // Direct process-to-process switching logic:
+  
+  // 1. Pass the value: Store it in the target's return register (a0) [cite: 160, 238]
+  target->trapframe->a0 = value;
+
+  // 2. Wake the target: Set its state directly to RUNNING, bypassing the scheduler [cite: 209]
+  target->state = RUNNING;
+
+  // 3. Current process goes to sleep: Set state to SLEEPING [cite: 162]
+  // Use the process itself as the channel to be woken up later by another co_yield
+  acquire(&p->lock);
+  p->chan = p;
+  p->state = SLEEPING;
+
+  // 4. Context Switch: Manually switch the CPU to the target process context [cite: 163, 208]
+  swtch(&p->context, &target->context);
+
+  // --- RENDEZVOUS POINT ---
+  // The process resumes here after another process yields back to it [cite: 164, 188]
+  
+  p->chan = 0;
+  release(&p->lock);
+  release(&target->lock);
+
+  // Return the value that was passed to us by the yielding process [cite: 179]
+  // The value is already in our a0 register via the trapframe
+  return p->trapframe->a0;
+}
 }
