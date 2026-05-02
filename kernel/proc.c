@@ -681,88 +681,100 @@ procdump(void)
     printf("\n");
   }
 
-// Implementation of the cooperative multitasking yield
-// Located in kernel/proc.c
+  ///////////////////////////////////
+  // מחזירה כתובת ייחודית שתשמש כ"ערוץ" (chan) שעליו התהליך יישן.
+// הכתובת של ה-context היא בחירה מצוינת כי היא ייחודית לתהליך ולא בשימוש של sleep רגיל.
+static void*
+get_co_chan(struct proc *p)
+{
+  return (void*)&p->context;
+}
+
+// מחפשת תהליך לפי PID, נועלת אותו ומחזירה מצביע אליו.
+// אם התהליך לא נמצא, מחזירה 0.
+static struct proc*
+find_and_lock_target(int pid)
+{
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid && p->state != UNUSED)
+      return p;
+    release(&p->lock);
+  }
+  return 0;
+}
 int
-do_co_yield(int target_pid, int value)
+co_yield(int pid, int value)
 {
   struct proc *p = myproc();
-  struct proc *target = 0;
-  struct proc *tmp;
+  struct proc *target;
+  int ret;
 
-  // Error condition: PID is invalid (negative or zero) [cite: 184]
-  // Error condition: A process cannot yield to itself [cite: 185]
-  if(target_pid <= 0 || target_pid == p->pid) {
+  // 1. בדיקת חוקיות קלט: PID לא חוקי או ניסיון לבצע yield לעצמנו [cite: 184, 185]
+  if(pid <= 0 || pid == p->pid)
     return -1;
-  }
 
-  // Find the target process in the process table [cite: 105, 205]
-  for(tmp = proc; tmp < &proc[NPROC]; tmp++){
-    if(tmp->pid == target_pid){
-      target = tmp;
-      break;
-    }
-  }
-
-  // Error condition: Target PID does not exist [cite: 183]
-  if(target == 0) {
+  // 2. חיפוש ונעילת תהליך המטרה
+  target = find_and_lock_target(pid);
+  if(target == 0) // התהליך לא קיים [cite: 183]
     return -1;
-  }
 
-  // Acquire target lock to check its state safely
-  acquire(&target->lock);
-
-  // Error condition: Target is already killed or is a zombie [cite: 183]
-  if(target->killed || target->state == UNUSED || target->state == ZOMBIE) {
+  // בדיקה שהתהליך לא נהרג או שהוא זומבי [cite: 183]
+  if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
     release(&target->lock);
-    return -1;
+    return -1; // [cite: 181]
   }
 
-  // Wait mechanism: If the target is not ready (not yet SLEEPING/waiting for yield),
-  // the yielding process must sleep.
-  // We use the target's address as a wait channel.
-  while(target->state != SLEEPING && !target->killed) {
-    release(&target->lock);
+  // 3. תרחיש ב': תהליך המטרה כבר הגיע ל-co_yield וישן בציפייה אלינו
+  if(target->state == SLEEPING && target->chan == get_co_chan(p)){
     
-    acquire(&p->lock);
-    sleep(target, &p->lock); 
-    release(&p->lock);
+    // קוראים את הערך שהוא שמר עבורנו ב-a1 שלו
+    ret = target->trapframe->a1;
     
-    acquire(&target->lock);
-  }
-
-  // Re-check if the target was killed while we were sleeping
-  if(target->killed){
+    // מעבירים לו את הערך שלנו ישירות לתוך אוגר ההחזרה שלו (a0)
+    target->trapframe->a0 = value;
+    
+    // מעירים אותו: משנים את מצבו ל-RUNNABLE (בשלב זה אנחנו עדיין נשענים על המתזמן)
+    target->state = RUNNABLE;
+    target->chan = 0;
+    
+    // משחררים את המנעול ומחזירים את הערך שקיבלנו [cite: 179]
     release(&target->lock);
-    return -1;
+    return ret; 
   }
 
-  // Direct process-to-process switching logic:
-  
-  // 1. Pass the value: Store it in the target's return register (a0) [cite: 160, 238]
-  target->trapframe->a0 = value;
-
-  // 2. Wake the target: Set its state directly to RUNNING, bypassing the scheduler [cite: 209]
-  target->state = RUNNING;
-
-  // 3. Current process goes to sleep: Set state to SLEEPING [cite: 162]
-  // Use the process itself as the channel to be woken up later by another co_yield
+  // 4. תרחיש א': אנחנו מגיעים ראשונים, תהליך המטרה עדיין לא מוכן
   acquire(&p->lock);
-  p->chan = p;
+  
+  // אם במקרה מישהו הרג אותנו בדיוק עכשיו
+  if(p->killed){
+    release(&p->lock);
+    release(&target->lock);
+    return -1;
+  }
+
+  // שומרים את הערך שאנחנו רוצים למסור ב-a1 שלנו
+  p->trapframe->a1 = value;
+  
+  // מגדירים את ה"ערוץ" שלנו לערוץ הייחודי של תהליך המטרה
+  p->chan = get_co_chan(target);
   p->state = SLEEPING;
 
-  // 4. Context Switch: Manually switch the CPU to the target process context [cite: 163, 208]
-  swtch(&p->context, &target->context);
-
-  // --- RENDEZVOUS POINT ---
-  // The process resumes here after another process yields back to it [cite: 164, 188]
-  
-  p->chan = 0;
-  release(&p->lock);
+  // חשוב מאוד: חייבים לשחרר את המנעול של המטרה לפני שאנחנו הולכים לישון
+  // אחרת תהליך המטרה לא יוכל להינעל כשהוא יקרא ל-co_yield בעצמו (Deadlock)
   release(&target->lock);
 
-  // Return the value that was passed to us by the yielding process [cite: 179]
-  // The value is already in our a0 register via the trapframe
-  return p->trapframe->a0;
+  // קוראים למתזמן הרגיל כדי לוותר על המעבד [cite: 214]
+  sched();
+
+  // --- הגענו לכאן רק אחרי שתהליך המטרה קרא לנו והעיר אותנו! ---
+  
+  // תהליך המטרה כבר שתל את הערך שהוא רצה למסור לנו בתוך ה-a0 שלנו
+  ret = p->trapframe->a0;
+  p->chan = 0;
+
+  release(&p->lock);
+  return ret; // [cite: 179]
 }
 }
