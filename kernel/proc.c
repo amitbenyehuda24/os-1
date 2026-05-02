@@ -681,17 +681,17 @@ procdump(void)
     printf("\n");
   }
 }
-  ///////////////////////////////////
-  // מחזירה כתובת ייחודית שתשמש כ"ערוץ" (chan) שעליו התהליך יישן.
-// הכתובת של ה-context היא בחירה מצוינת כי היא ייחודית לתהליך ולא בשימוש של sleep רגיל.
+ ///////////////////////////////////
+// Returns a unique address to be used as the "channel" (chan) on which the process will sleep.
+// The address of the context is an excellent choice because it is unique to the process and not used by regular sleep.
 static void*
 get_co_chan(struct proc *p)
 {
   return (void*)&p->context;
 }
 
-// מחפשת תהליך לפי PID, נועלת אותו ומחזירה מצביע אליו.
-// אם התהליך לא נמצא, מחזירה 0.
+// Searches for a process by PID, locks it, and returns a pointer to it.
+// If the process is not found, returns 0.
 static struct proc*
 find_and_lock_target(int pid)
 {
@@ -704,33 +704,33 @@ find_and_lock_target(int pid)
   }
   return 0;
 }
-// מבצעת את החלפת ההקשר הישירה בין שני התהליכים ואת הניקוי לאחר ההתעוררות
+// Performs the direct context switch between the two processes and the cleanup after waking up
 static int
 do_co_switch(struct proc *p, struct proc *target)
 {
   int ret;
 
-  // מרדימים את עצמנו ומאותתים שאנחנו מוכנים ל-yield נגדי
+  // Put ourselves to sleep and signal that we are ready for a counter-yield
   p->chan = get_co_chan(target);
   p->state = SLEEPING;
   
-  // עקיפת המתזמן: מעבירים את המטרה ישירות ל-RUNNING ומשייכים למעבד 
+  // Scheduler bypass: change target directly to RUNNING and attach it to the CPU 
   target->state = RUNNING;
   target->chan = 0;
   mycpu()->proc = target;
   
-  // ריקוד המנעולים: משחררים *רק* את המנעול שלנו לפני הקפיצה!
+  // Lock dance: release *only* our lock before the jump!
   release(&p->lock);
   
-  // החלפת הקשר ישירה! מדלגים על ה-Scheduler לחלוטין
+  // Direct context switch! Skipping the Scheduler completely
   swtch(&p->context, &target->context);
 
-  // --- התעוררנו כאן כי תהליך אחר ביצע yield אלינו ---
+  // --- We woke up here because another process yielded to us ---
   
   ret = p->trapframe->a0;
   p->chan = 0;
   
-  // משחררים את המנעול שלנו שהועבר אלינו "בירושה" וחוזרים למשתמש
+  // Release our lock that was "inherited" by us and return to the user
   release(&p->lock);
   
   return ret; 
@@ -741,16 +741,16 @@ co_yield(int pid, int value)
   struct proc *p = myproc();
   struct proc *target;
 
-  // 1. בדיקת חוקיות קלט
+  // 1. Input validation
   if(pid <= 0 || pid == p->pid)
     return -1;
 
-  // 2. חיפוש ונעילת תהליך המטרה
+  // 2. Find and lock the target process
   target = find_and_lock_target(pid);
   if(target == 0)
     return -1;
 
-  // בדיקה שהתהליך לא נהרג או שהוא זומבי
+  // Check that the process wasn't killed and is not a zombie
   if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
     release(&target->lock);
     return -1;
@@ -763,21 +763,21 @@ co_yield(int pid, int value)
     return -1;
   }
 
-  // 3. תרחיש ב': תהליך המטרה כבר הגיע ל-co_yield וישן בציפייה אלינו
+  // 3. Scenario B: The target process has already reached co_yield and is sleeping waiting for us
   if(target->state == SLEEPING && target->chan == get_co_chan(p)){
     
-    // החלפת הערכים בעזרת ה-trapframe
+    // Exchange values using the trapframe
     p->trapframe->a1 = value;
     p->trapframe->a0 = target->trapframe->a1; 
     
     if(target->trapframe->a0 == (uint64)-1)
         target->trapframe->a0 = value;
 
-    // קריאה לפונקציית העזר לביצוע המעבר
+    // Call the helper function to perform the switch
     return do_co_switch(p, target);
   }
 
-  // 4. תרחיש א': אנחנו מגיעים ראשונים ותהליך המטרה לא קרא עדיין ל-co_yield
+  // 4. Scenario A: We arrive first and the target process hasn't called co_yield yet
   if(target->state != RUNNABLE){
     release(&p->lock);
     release(&target->lock);
@@ -785,8 +785,8 @@ co_yield(int pid, int value)
   }
 
   p->trapframe->a1 = value;
-  p->trapframe->a0 = -1; // נשים ערך זמני עד שנקבל תשובה
+  p->trapframe->a0 = -1; // Put a temporary value until we get an answer
   
-  // קריאה לפונקציית העזר לביצוע המעבר
+  // Call the helper function to perform the switch
   return do_co_switch(p, target);
 }
