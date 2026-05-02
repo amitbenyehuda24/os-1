@@ -726,54 +726,83 @@ co_yield(int pid, int value)
     return -1; // [cite: 181]
   }
 
-  // 3. תרחיש ב': תהליך המטרה כבר הגיע ל-co_yield וישן בציפייה אלינו
-  if(target->state == SLEEPING && target->chan == get_co_chan(p)){
-    
-    // קוראים את הערך שהוא שמר עבורנו ב-a1 שלו
-    ret = target->trapframe->a1;
-    
-    // מעבירים לו את הערך שלנו ישירות לתוך אוגר ההחזרה שלו (a0)
-    target->trapframe->a0 = value;
-    
-    // מעירים אותו: משנים את מצבו ל-RUNNABLE (בשלב זה אנחנו עדיין נשענים על המתזמן)
-    target->state = RUNNABLE;
-    target->chan = 0;
-    
-    // משחררים את המנעול ומחזירים את הערך שקיבלנו [cite: 179]
-    release(&target->lock);
-    return ret; 
-  }
-
-  // 4. תרחיש א': אנחנו מגיעים ראשונים, תהליך המטרה עדיין לא מוכן
+  // נועלים גם את התהליך שלנו - אנחנו נצטרך את המנעול כדי להגן על שינוי המצב שלנו וההעברה
   acquire(&p->lock);
-  
-  // אם במקרה מישהו הרג אותנו בדיוק עכשיו
   if(p->killed){
     release(&p->lock);
     release(&target->lock);
     return -1;
   }
 
+  // 3. תרחיש ב': תהליך המטרה כבר הגיע ל-co_yield וישן בציפייה אלינו
+  if(target->state == SLEEPING && target->chan == get_co_chan(p)){
+    
+    // החלפת הערכים בעזרת ה-trapframe [cite: 164]
+    p->trapframe->a1 = value;
+    p->trapframe->a0 = target->trapframe->a1; 
+    
+    // מוודאים שאנחנו משלימים את הערך להחזרה של תהליך המטרה
+    if(target->trapframe->a0 == (uint64)-1)
+        target->trapframe->a0 = value;
+
+    // מרדימים את עצמנו ומאותתים שאנחנו מוכנים ל-yield נגדי [cite: 162]
+    p->chan = get_co_chan(target);
+    p->state = SLEEPING;
+    
+    // עקיפת המתזמן: מעבירים את המטרה ישירות ל-RUNNING ומשייכים למעבד 
+    target->state = RUNNING;
+    target->chan = 0;
+    mycpu()->proc = target;
+    
+    // ריקוד המנעולים: משחררים *רק* את המנעול שלנו לפני הקפיצה!
+    // המנעול של המטרה נשאר נעול, כי המטרה מצפה להתעורר כשהיא נעולה.
+    release(&p->lock);
+    
+    // החלפת הקשר ישירה! מדלגים על ה-Scheduler לחלוטין [cite: 163]
+    swtch(&p->context, &target->context);
+
+    // --- התעוררנו כאן כי תהליך אחר ביצע yield אלינו ---
+    // כשאנחנו מתעוררים מ-swtch, המנעול שלנו (p->lock) מוחזק שוב על ידי התהליך שהעיר אותנו!
+    ret = p->trapframe->a0;
+    p->chan = 0;
+    
+    // משחררים את המנעול שלנו שהועבר אלינו "בירושה" וחוזרים למשתמש [cite: 179]
+    release(&p->lock);
+    return ret; 
+  }
+
+  // 4. תרחיש א': אנחנו מגיעים ראשונים ותהליך המטרה לא קרא עדיין ל-co_yield
+  // כדי להעביר לו שליטה ישירה, הוא חייב להיות במצב RUNNABLE 
+  // (אם הוא SLEEPING על משהו אחר, אי אפשר להעביר לו מעבד).
+  if(target->state != RUNNABLE){
+    release(&p->lock);
+    release(&target->lock);
+    return -1; // [cite: 181]
+  }
+
   // שומרים את הערך שאנחנו רוצים למסור ב-a1 שלנו
   p->trapframe->a1 = value;
+  p->trapframe->a0 = -1; // נשים ערך זמני עד שנקבל תשובה
   
-  // מגדירים את ה"ערוץ" שלנו לערוץ הייחודי של תהליך המטרה
+  // מגדירים ערוץ ומרדימים את עצמנו [cite: 161]
   p->chan = get_co_chan(target);
-  p->state = SLEEPING;
+  p->state = SLEEPING; // [cite: 162]
 
-  // חשוב מאוד: חייבים לשחרר את המנעול של המטרה לפני שאנחנו הולכים לישון
-  // אחרת תהליך המטרה לא יוכל להינעל כשהוא יקרא ל-co_yield בעצמו (Deadlock)
-  release(&target->lock);
+  // עקיפת המתזמן - מדלגים על RUNNABLE ישירות ל-RUNNING [cite: 209]
+  target->state = RUNNING;
+  mycpu()->proc = target;
 
-  // קוראים למתזמן הרגיל כדי לוותר על המעבד [cite: 214]
-  sched();
-
-  // --- הגענו לכאן רק אחרי שתהליך המטרה קרא לנו והעיר אותנו! ---
+  // שוב, משחררים רק את המנעול שלנו לפני הקפיצה למטרה
+  release(&p->lock);
   
-  // תהליך המטרה כבר שתל את הערך שהוא רצה למסור לנו בתוך ה-a0 שלנו
+  // קפיצה ישירה לתהליך המטרה מחוץ למתזמן [cite: 163]
+  swtch(&p->context, &target->context);
+
+  // --- התעוררנו כאן מ-yield נגדי ---
   ret = p->trapframe->a0;
   p->chan = 0;
 
+  // שחרור המנעול שלנו והחזרת הערך המוצלח [cite: 179]
   release(&p->lock);
-  return ret; // [cite: 179]
+  return ret; 
 }
