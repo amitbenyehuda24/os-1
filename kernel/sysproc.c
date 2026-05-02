@@ -91,15 +91,19 @@ sys_uptime(void)
 }
 
 uint64
+sys_memsize(void)
+{
+  return myproc()->sz;
+}
+
+uint64
 sys_co_yield(void)
 {
   int pid, value;
   
   // Extract the first two integer arguments from the user registers
-  if(argint(0, &pid) < 0 || argint(1, &value) < 0) {
-    return -1;
-  }
-    
+  argint(0, &pid);
+  argint(1, &value);
   // Call the core logic function located in proc.c
-  return do_co_yield(pid, value);
+  return co_yield(pid, value);
 }

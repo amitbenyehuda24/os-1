@@ -680,7 +680,7 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
-
+}
   ///////////////////////////////////
   // מחזירה כתובת ייחודית שתשמש כ"ערוץ" (chan) שעליו התהליך יישן.
 // הכתובת של ה-context היא בחירה מצוינת כי היא ייחודית לתהליך ולא בשימוש של sleep רגיל.
@@ -776,5 +776,4 @@ co_yield(int pid, int value)
 
   release(&p->lock);
   return ret; // [cite: 179]
-}
 }
