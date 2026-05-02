@@ -704,29 +704,58 @@ find_and_lock_target(int pid)
   }
   return 0;
 }
+// מבצעת את החלפת ההקשר הישירה בין שני התהליכים ואת הניקוי לאחר ההתעוררות
+static int
+do_co_switch(struct proc *p, struct proc *target)
+{
+  int ret;
+
+  // מרדימים את עצמנו ומאותתים שאנחנו מוכנים ל-yield נגדי
+  p->chan = get_co_chan(target);
+  p->state = SLEEPING;
+  
+  // עקיפת המתזמן: מעבירים את המטרה ישירות ל-RUNNING ומשייכים למעבד 
+  target->state = RUNNING;
+  target->chan = 0;
+  mycpu()->proc = target;
+  
+  // ריקוד המנעולים: משחררים *רק* את המנעול שלנו לפני הקפיצה!
+  release(&p->lock);
+  
+  // החלפת הקשר ישירה! מדלגים על ה-Scheduler לחלוטין
+  swtch(&p->context, &target->context);
+
+  // --- התעוררנו כאן כי תהליך אחר ביצע yield אלינו ---
+  
+  ret = p->trapframe->a0;
+  p->chan = 0;
+  
+  // משחררים את המנעול שלנו שהועבר אלינו "בירושה" וחוזרים למשתמש
+  release(&p->lock);
+  
+  return ret; 
+}
 int
 co_yield(int pid, int value)
 {
   struct proc *p = myproc();
   struct proc *target;
-  int ret;
 
-  // 1. בדיקת חוקיות קלט: PID לא חוקי או ניסיון לבצע yield לעצמנו [cite: 184, 185]
+  // 1. בדיקת חוקיות קלט
   if(pid <= 0 || pid == p->pid)
     return -1;
 
   // 2. חיפוש ונעילת תהליך המטרה
   target = find_and_lock_target(pid);
-  if(target == 0) // התהליך לא קיים [cite: 183]
+  if(target == 0)
     return -1;
 
-  // בדיקה שהתהליך לא נהרג או שהוא זומבי [cite: 183]
+  // בדיקה שהתהליך לא נהרג או שהוא זומבי
   if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
     release(&target->lock);
-    return -1; // [cite: 181]
+    return -1;
   }
 
-  // נועלים גם את התהליך שלנו - אנחנו נצטרך את המנעול כדי להגן על שינוי המצב שלנו וההעברה
   acquire(&p->lock);
   if(p->killed){
     release(&p->lock);
@@ -737,72 +766,27 @@ co_yield(int pid, int value)
   // 3. תרחיש ב': תהליך המטרה כבר הגיע ל-co_yield וישן בציפייה אלינו
   if(target->state == SLEEPING && target->chan == get_co_chan(p)){
     
-    // החלפת הערכים בעזרת ה-trapframe [cite: 164]
+    // החלפת הערכים בעזרת ה-trapframe
     p->trapframe->a1 = value;
     p->trapframe->a0 = target->trapframe->a1; 
     
-    // מוודאים שאנחנו משלימים את הערך להחזרה של תהליך המטרה
     if(target->trapframe->a0 == (uint64)-1)
         target->trapframe->a0 = value;
 
-    // מרדימים את עצמנו ומאותתים שאנחנו מוכנים ל-yield נגדי [cite: 162]
-    p->chan = get_co_chan(target);
-    p->state = SLEEPING;
-    
-    // עקיפת המתזמן: מעבירים את המטרה ישירות ל-RUNNING ומשייכים למעבד 
-    target->state = RUNNING;
-    target->chan = 0;
-    mycpu()->proc = target;
-    
-    // ריקוד המנעולים: משחררים *רק* את המנעול שלנו לפני הקפיצה!
-    // המנעול של המטרה נשאר נעול, כי המטרה מצפה להתעורר כשהיא נעולה.
-    release(&p->lock);
-    
-    // החלפת הקשר ישירה! מדלגים על ה-Scheduler לחלוטין [cite: 163]
-    swtch(&p->context, &target->context);
-
-    // --- התעוררנו כאן כי תהליך אחר ביצע yield אלינו ---
-    // כשאנחנו מתעוררים מ-swtch, המנעול שלנו (p->lock) מוחזק שוב על ידי התהליך שהעיר אותנו!
-    ret = p->trapframe->a0;
-    p->chan = 0;
-    
-    // משחררים את המנעול שלנו שהועבר אלינו "בירושה" וחוזרים למשתמש [cite: 179]
-    release(&p->lock);
-    return ret; 
+    // קריאה לפונקציית העזר לביצוע המעבר
+    return do_co_switch(p, target);
   }
 
   // 4. תרחיש א': אנחנו מגיעים ראשונים ותהליך המטרה לא קרא עדיין ל-co_yield
-  // כדי להעביר לו שליטה ישירה, הוא חייב להיות במצב RUNNABLE 
-  // (אם הוא SLEEPING על משהו אחר, אי אפשר להעביר לו מעבד).
   if(target->state != RUNNABLE){
     release(&p->lock);
     release(&target->lock);
-    return -1; // [cite: 181]
+    return -1;
   }
 
-  // שומרים את הערך שאנחנו רוצים למסור ב-a1 שלנו
   p->trapframe->a1 = value;
   p->trapframe->a0 = -1; // נשים ערך זמני עד שנקבל תשובה
   
-  // מגדירים ערוץ ומרדימים את עצמנו [cite: 161]
-  p->chan = get_co_chan(target);
-  p->state = SLEEPING; // [cite: 162]
-
-  // עקיפת המתזמן - מדלגים על RUNNABLE ישירות ל-RUNNING [cite: 209]
-  target->state = RUNNING;
-  mycpu()->proc = target;
-
-  // שוב, משחררים רק את המנעול שלנו לפני הקפיצה למטרה
-  release(&p->lock);
-  
-  // קפיצה ישירה לתהליך המטרה מחוץ למתזמן [cite: 163]
-  swtch(&p->context, &target->context);
-
-  // --- התעוררנו כאן מ-yield נגדי ---
-  ret = p->trapframe->a0;
-  p->chan = 0;
-
-  // שחרור המנעול שלנו והחזרת הערך המוצלח [cite: 179]
-  release(&p->lock);
-  return ret; 
+  // קריאה לפונקציית העזר לביצוע המעבר
+  return do_co_switch(p, target);
 }
